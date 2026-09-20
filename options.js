@@ -41,7 +41,7 @@ async function exportLog() {
 
 async function clearCache() {
   const all = await chrome.storage.local.get(null);
-  await chrome.storage.local.remove(Object.keys(all).filter(k => k.startsWith("v:")));
+  await chrome.storage.local.remove(Object.keys(all).filter(k => k.startsWith("v:") || k.startsWith("h:")));
   $("msg").textContent = "缓存已清空";
 }
 

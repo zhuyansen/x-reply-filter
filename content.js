@@ -2,6 +2,9 @@
 (() => {
   const REASON_LABEL = { spam: "推广/垃圾", bait: "互动饵", offtopic: "跑题", slop: "AI 套话", user: "同类（你标记过）" };
   const MAX_STORED_EXAMPLES = 30;
+  const MAX_CACHED_VERDICTS = 5000;
+  const PRUNE_TO = 4000;
+  const CACHE_COUNT = "cacheCount";
   const MAX_RECENT = 50;
   const EXAMPLE_TEXT = 200;
   const BATCH_DELAY_MS = 600;
@@ -79,7 +82,8 @@
     const other = kind === "bad" ? "good" : "bad";
     examples[other] = examples[other].filter(e => e.id !== data.id);
     examples[kind] = [...examples[kind].filter(e => e.id !== data.id), { id: data.id, t: data.text.slice(0, EXAMPLE_TEXT), h: data.handle, ts: Date.now() }].slice(-MAX_STORED_EXAMPLES);
-    await chrome.storage.local.set({ examples, ["v:" + data.id]: kind === "bad" ? { cat: "user", p: 1 } : null, ["keep:" + data.id]: kind === "good" });
+    const entry = kind === "bad" ? { cat: "user", p: 1, ts: Date.now() } : { ts: Date.now() };
+    await chrome.storage.local.set({ examples, ["v:" + data.id]: entry, [contentKey(data)]: entry, ["keep:" + data.id]: kind === "good" });
     await dropRecent(data.id);
     return true;
   });
@@ -129,7 +133,7 @@
       const act = e.target?.dataset?.act;
       if (act === "block") { await blockHandle(data.handle); e.target.textContent = "已屏蔽"; return; }
       if (act === "wrong" && data && await saveExample("good", data)) toast("good");
-      if (act === "undo" && data) { const { examples } = await chrome.storage.local.get({ examples: { bad: [], good: [] } }); examples.bad = examples.bad.filter(x => x.id !== data.id); await chrome.storage.local.set({ examples, ["v:" + data.id]: null }); }
+      if (act === "undo" && data) { const { examples } = await chrome.storage.local.get({ examples: { bad: [], good: [] } }); examples.bad = examples.bad.filter(x => x.id !== data.id); await chrome.storage.local.set({ examples, ["v:" + data.id]: { ts: Date.now() }, [contentKey(data)]: { ts: Date.now() } }); }
       expandOne(article, bar);
     });
     article.classList.add("xrf-hidden");
@@ -153,12 +157,42 @@
     article.appendChild(btn);
   }
 
-  async function cached(ids) {
-    const got = await chrome.storage.local.get(ids.map(i => "v:" + i));
-    return Object.fromEntries(ids.map(i => [i, got["v:" + i]]));
+  // Verdicts are cached under two keys: the tweet id, and a hash of author+text.
+  // The content hash means the same reply is never judged twice even when X hands us a different
+  // id for it, or when the identical spam shows up under another post.
+  function contentKey(data) {
+    const src = `${data.handle}\u0000${data.text}`;
+    let h = 2166136261;
+    for (let i = 0; i < src.length; i++) { h ^= src.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return "h:" + (h >>> 0).toString(36) + src.length.toString(36);
   }
 
-  async function classifyBatch(fresh) {
+  async function cached(items) {
+    const keys = items.flatMap(b => ["v:" + b.data.id, contentKey(b.data)]);
+    const got = await chrome.storage.local.get([...keys, CACHE_COUNT]);
+    const verdicts = items.map(b => {
+      const byId = got["v:" + b.data.id];
+      return byId !== undefined ? byId : got[contentKey(b.data)];
+    });
+    return { verdicts, count: Number(got[CACHE_COUNT] || 0) };
+  }
+
+  // storage.local is not unlimited, so keep the cache bounded. The approximate entry count rides along
+  // with the lookup that flush() already does, so the expensive full read only happens when it is needed.
+  let pruned = false;
+  const pruneCache = guard(async function pruneCacheImpl(countHint) {
+    if (pruned || countHint <= MAX_CACHED_VERDICTS) return;
+    pruned = true;
+    const all = await chrome.storage.local.get(null);
+    const keys = Object.keys(all).filter(k => k.startsWith("v:") || k.startsWith("h:"));
+    if (keys.length <= MAX_CACHED_VERDICTS) { await chrome.storage.local.set({ [CACHE_COUNT]: keys.length }); return; }
+    const byAge = keys.map(k => [k, all[k]?.ts || 0]).sort((a, b) => a[1] - b[1]);
+    await chrome.storage.local.remove(byAge.slice(0, keys.length - PRUNE_TO).map(([k]) => k));
+    await chrome.storage.local.set({ [CACHE_COUNT]: PRUNE_TO });
+    console.info(`[xrf] pruned verdict cache: ${keys.length} -> ${PRUNE_TO}`);
+  });
+
+  async function classifyBatch(fresh, count) {
     const res = await chrome.runtime.sendMessage({ type: "classify", original: originalTweet(), replies: fresh.map(b => b.data) });
     if (!res || res.error) {
       stats.note = res?.error === "quota" ? "今日免费额度已用完，仅规则过滤" : "jev 暂不可用，仅规则过滤";
@@ -168,16 +202,33 @@
     stats.note = "";
     console.info(`[xrf] jev(${res.mode}) batch ${fresh.length} replies -> ${res.verdicts.filter(Boolean).length} hidden`);
     const store = {};
-    res.verdicts.forEach((v, i) => { store["v:" + fresh[i].data.id] = v || null; if (v) collapse(fresh[i].el, REASON_LABEL[v.cat], v.p, fresh[i].data); });
+    res.verdicts.forEach((v, i) => {
+      const data = fresh[i].data;
+      const entry = v ? { ...v, ts: Date.now() } : { ts: Date.now() };
+      store["v:" + data.id] = entry;
+      store[contentKey(data)] = entry;
+      if (v) collapse(fresh[i].el, REASON_LABEL[v.cat], v.p, data);
+    });
+    store[CACHE_COUNT] = count + Object.keys(store).length;
     await chrome.storage.local.set(store);
+    pruneCache(store[CACHE_COUNT]);
   }
 
   const flush = guard(async function flushImpl() {
     const batch = pending.splice(0, BATCH_SIZE);
     if (!batch.length) return;
-    const cache = await cached(batch.map(b => b.data.id));
-    const fresh = batch.filter(b => { const v = cache[b.data.id]; if (v === undefined) return true; if (v) collapse(b.el, REASON_LABEL[v.cat] || "你标记的", v.p, b.data); return false; });
-    if (fresh.length) await classifyBatch(fresh).catch(e => console.warn("[xrf]", e));
+    const { verdicts: cache, count } = await cached(batch);
+    const fresh = [];
+    const seenKeys = new Set();
+    batch.forEach((b, i) => {
+      const v = cache[i];
+      if (v !== undefined) { if (v && v.cat) collapse(b.el, REASON_LABEL[v.cat] || "你标记的", v.p, b.data); return; }
+      const key = contentKey(b.data);
+      if (seenKeys.has(key)) return;  // identical text twice in one batch: ask once
+      seenKeys.add(key);
+      fresh.push(b);
+    });
+    if (fresh.length) await classifyBatch(fresh, count).catch(e => console.warn("[xrf]", e));
     stats.pending = pending.length;
     report();
     if (pending.length) timer = setTimeout(flush, BATCH_DELAY_MS);
