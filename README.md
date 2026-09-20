@@ -36,6 +36,8 @@ OPENROUTER_API_KEY=sk-or-... ./deploy.sh   # 建 KV、写 secret、部署、自�
 
 额度和预算在 `worker/wrangler.jsonc` 的 `vars` 里改。
 
+**KV 写入预算**：免费版每天 1,000 次写入，所以每次请求最多写 1 个键（每日每 IP 计数）。全局花费是抽样写入（默认 25 次请求写 1 次，按 25 倍累加），只作粗粒度兜底；真正的闸门是每 IP 每天 600 条。改 worker 后跑 `node test/worker.routes.test.js` 验证所有路由。
+
 ## 安装
 
 1. Chrome 打开 `chrome://extensions`，开启右上角「开发者模式」

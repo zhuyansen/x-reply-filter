@@ -17,39 +17,40 @@ function validate(body) {
   return null;
 }
 
-// installId is client-generated, so it can be rotated freely. The per-IP cap is what actually stops one
-// person from draining the shared daily budget; the IP is hashed so raw addresses are never stored.
+// KV free tier allows 1,000 writes/day, so each request must cost at most ONE write.
+// installId is client-generated and trivially rotated, so the per-IP counter is the real limit and the
+// only one we persist. The IP is hashed, never stored raw.
 async function ipKey(req) {
   const ip = req.headers.get("CF-Connecting-IP") || "unknown";
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`xrf:${today()}:${ip}`));
   return Array.from(new Uint8Array(digest).slice(0, 12), b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function readCounters(env, id, ip) {
-  const [used, spent, ipUsed] = await Promise.all([env.QUOTA.get(`q:${today()}:${id}`), env.QUOTA.get(`budget:${today()}`), ip ? env.QUOTA.get(`ip:${today()}:${ip}`) : null]);
-  return { used: Number(used || 0), spent: Number(spent || 0), ipUsed: Number(ipUsed || 0) };
+async function readIpUsed(env, ip) {
+  return Number((await env.QUOTA.get(`ip:${today()}:${ip}`)) || 0);
 }
 
-async function bump(env, id, ip, n, cost) {
-  const { used, spent, ipUsed } = await readCounters(env, id, ip);
-  await Promise.all([
-    env.QUOTA.put(`q:${today()}:${id}`, String(used + n), { expirationTtl: DAY_TTL_S }),
-    env.QUOTA.put(`ip:${today()}:${ip}`, String(ipUsed + n), { expirationTtl: DAY_TTL_S }),
-    env.QUOTA.put(`budget:${today()}`, String(spent + cost), { expirationTtl: DAY_TTL_S }),
-  ]);
-  return used + n;
+// The global budget is a coarse backstop behind the per-IP cap, so it is sampled instead of written
+// every request: one write in BUDGET_SAMPLE requests, incremented by SAMPLE x cost (unbiased on average).
+async function bumpBudget(env, cost) {
+  const sample = Number(env.BUDGET_SAMPLE || 25);
+  if (!cost || Math.random() >= 1 / sample) return;
+  const spent = Number((await env.QUOTA.get(`budget:${today()}`)) || 0);
+  await env.QUOTA.put(`budget:${today()}`, String(spent + cost * sample), { expirationTtl: DAY_TTL_S });
 }
 
-async function classify(body, env, req) {
-  const perId = Number(env.DAILY_PER_ID), perIp = Number(env.DAILY_PER_IP), budget = Number(env.DAILY_BUDGET_USD);
+async function classify(body, env, req, ctx) {
+  const perIp = Number(env.DAILY_PER_IP), budget = Number(env.DAILY_BUDGET_USD);
   const ip = await ipKey(req);
-  const { used, spent, ipUsed } = await readCounters(env, body.installId, ip);
-  if (used + body.replies.length > perId) return json({ error: "quota", used, limit: perId }, 429);
-  if (ipUsed + body.replies.length > perIp) return json({ error: "quota", scope: "ip", limit: perIp }, 429);
+  const [ipUsed, spent] = [await readIpUsed(env, ip), Number((await env.QUOTA.get(`budget:${today()}`)) || 0)];
+  if (ipUsed + body.replies.length > perIp) return json({ error: "quota", used: ipUsed, limit: perIp }, 429);
   if (spent >= budget) return json({ error: "budget" }, 429);
+
   const resp = await callJev(env.OPENROUTER_API_KEY, body.original, body.replies, body.categories, body.examples);
-  const nowUsed = await bump(env, body.installId, ip, body.replies.length, resp.usage?.cost || 0);
-  return json({ answers: resp.answers, usage: resp.usage, model: resp.model, quota: { used: nowUsed, limit: perId } });
+  const nowUsed = ipUsed + body.replies.length;
+  await env.QUOTA.put(`ip:${today()}:${ip}`, String(nowUsed), { expirationTtl: DAY_TTL_S });
+  ctx.waitUntil(bumpBudget(env, resp.usage?.cost || 0));
+  return json({ answers: resp.answers, usage: resp.usage, model: resp.model, quota: { used: nowUsed, limit: perIp } });
 }
 
 const PAGE_CSS = "body{font:16px/1.65 -apple-system,system-ui,sans-serif;max-width:720px;margin:48px auto;padding:0 20px;color:#0f1419}h1{font-size:28px}h2{font-size:19px;margin-top:32px}code{background:#f2f4f5;padding:1px 5px;border-radius:4px}a{color:#1d9bf0}li{margin:6px 0}.muted{color:#536471;font-size:14px}";
@@ -76,22 +77,20 @@ const HOME = `<h1>Reply Filter for X</h1><p>Collapses spam, engagement bait, off
 <p><a href="/privacy">Privacy Policy</a> · <a href="https://github.com/zhuyansen/x-reply-filter">Source code (MIT)</a></p><p class="muted">This domain also hosts the free-tier API used by the extension.</p>`;
 
 export default {
-  async fetch(req, env) {
+  async fetch(req, env, ctx) {
     if (req.method === "OPTIONS") return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "Content-Type", "Access-Control-Allow-Methods": "POST" } });
     const url = new URL(req.url);
     if (req.method === "GET" && url.pathname === "/privacy") return html(PRIVACY);
     if (req.method === "GET" && url.pathname === "/") return html(HOME);
     if (req.method === "GET" && url.pathname === "/quota") {
-      const id = url.searchParams.get("id") || "";
-      if (!ID_RE.test(id)) return json({ error: "bad_install_id" }, 400);
-      const { used } = await readCounters(env, id);
-      return json({ used, limit: Number(env.DAILY_PER_ID) });
+      const used = await readIpUsed(env, await ipKey(req));  // reported per IP; the id param is kept for older clients
+      return json({ used, limit: Number(env.DAILY_PER_IP) });
     }
     if (req.method !== "POST" || url.pathname !== "/classify") return json({ error: "not_found" }, 404);
     let body; try { body = await req.json(); } catch { return json({ error: "bad_json" }, 400); }
     const err = validate(body);
     if (err) return json({ error: err }, 400);
-    try { return await classify(body, env, req); }
+    try { return await classify(body, env, req, ctx); }
     catch (e) { return json({ error: "upstream", detail: String(e.message || e).slice(0, 200) }, 502); }
   },
 };

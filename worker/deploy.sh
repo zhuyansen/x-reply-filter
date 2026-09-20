@@ -14,4 +14,5 @@ if grep -q REPLACE_AFTER wrangler.jsonc; then
 fi
 echo "$OPENROUTER_API_KEY" | $W secret put OPENROUTER_API_KEY
 $W deploy
+node ../test/worker.routes.test.js
 echo "deployed to the custom domain in wrangler.jsonc (routes); background.js proxyUrl must match it"

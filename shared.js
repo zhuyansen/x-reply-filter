@@ -10,7 +10,7 @@ const QUESTION_DEFS = {
   slop: ["Does this reply read like generic AI-generated filler with no specific point?", "Generic AI filler", "Specific, human-sounding"],
 };
 const USER_QUESTION = ["Is this reply the same KIND of low-value reply as the examples the user marked LOW-VALUE (and unlike the ones marked KEEP)?", "Same kind as the user's low-value examples", "Not like them, or like the KEEP examples"];
-const MAX_REPLIES = 8;
+const MAX_REPLIES = 20;  // server accepts bigger batches; fewer requests means fewer KV writes
 const MAX_TEXT = 600;
 const MAX_EXAMPLES = 10;
 const MAX_EXAMPLE_TEXT = 200;
