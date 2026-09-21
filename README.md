@@ -3,7 +3,7 @@
 Chrome 扩展（MV3）：在 x.com 的推文详情页折叠低质量回复。两级判定：
 
 1. **本地规则**（`rules.js`，零成本）：推广引流、加密货币 shill、AI 工具推销、互动饵（"so true"、纯 emoji、"first"）、纯链接、疑似机器人账号
-2. **jev 判定**（`background.js`）：剩余回复每 8 条一批发给 TypeSafe jev（经 OpenRouter `alpha/decisions`），四个 noul 问题：推广/垃圾、互动饵、跑题、AI 套话；任一 ≥ 阈值（默认 0.75）即折叠
+2. **jev 判定**（`background.js`）：剩余回复每 20 条一批（攒满即发，否则空闲 1.5 秒后发）发给 TypeSafe jev（经 OpenRouter `alpha/decisions`），四个 noul 问题：推广/垃圾、互动饵、跑题、AI 套话；任一 ≥ 阈值（默认 0.75）即折叠
 
 折叠成一行「已隐藏 · 类别 · 概率 · 点击展开」，不删内容，方便校验误判。
 
@@ -38,7 +38,16 @@ OPENROUTER_API_KEY=sk-or-... ./deploy.sh   # 建 KV、写 secret、部署、自�
 
 额度和预算在 `worker/wrangler.jsonc` 的 `vars` 里改。
 
-**KV 写入预算**：免费版每天 1,000 次写入，所以每次请求最多写 1 个键（每日每 IP 计数）。全局花费是抽样写入（默认 25 次请求写 1 次，按 25 倍累加），只作粗粒度兜底；真正的闸门是每 IP 每天 600 条。改 worker 后跑 `node test/worker.routes.test.js` 验证所有路由。
+**计数在 Durable Objects 里**（`worker/src/counters.js`）：KV 免费版每天只有 1,000 次写入，按请求写计数会打满，所以配额计数改用 DO 的 SQLite，没有每日写入上限，而且「检查 + 占用」在一个对象里原子完成，并发请求不会同时越过限额。每天的汇总留在 `h:<日期>` 行里，永不清理，供日报读取。
+
+**运营接口**：`GET /report?token=…`（口令是 Worker secret `REPORT_TOKEN`，本机副本在 `~/.config/xrf/report_token`）返回今日和近 14 天的 IP 数、判定条数、花费。日报脚本：
+
+```bash
+python3 ops/daily_report.py          # 人读
+python3 ops/daily_report.py --json   # 机读
+```
+
+改 worker 后跑 `node test/worker.routes.test.js` 验证所有路由。
 
 ## 安装
 

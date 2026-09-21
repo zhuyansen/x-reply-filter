@@ -4,7 +4,9 @@
   "compatibility_date": "2026-09-01",
   "workers_dev": false,
   "routes": [{ "pattern": "xrf.ship2market.ai", "custom_domain": true }],
+  "durable_objects": { "bindings": [{ "name": "COUNTERS", "class_name": "Counters" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counters"] }],
   "kv_namespaces": [{ "binding": "QUOTA", "id": "5cafee79cfcc434d98f022403b71bbbb" }],
-  "vars": { "DAILY_PER_IP": "600", "BUDGET_SAMPLE": "25", "DAILY_BUDGET_USD": "2", "ALLOWED_ORIGIN_PREFIX": "chrome-extension://" }
+  "vars": { "DAILY_PER_IP": "600",  "DAILY_BUDGET_USD": "2", "ALLOWED_ORIGIN_PREFIX": "chrome-extension://" }
   // secret: OPENROUTER_API_KEY  -> `wrangler secret put OPENROUTER_API_KEY`
 }

@@ -1,9 +1,9 @@
 // Free-tier proxy: holds the OpenRouter key, enforces per-install and global daily quotas, forwards to jev.
 import shared from "../../shared.js";
+export { Counters } from "./counters.js";
 
 const { MAX_REPLIES, callJev } = shared;
 const ID_RE = /^[a-f0-9]{32}$/;
-const DAY_TTL_S = 60 * 60 * 26;
 
 const json = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" } });
 const today = () => new Date().toISOString().slice(0, 10);
@@ -17,40 +17,32 @@ function validate(body) {
   return null;
 }
 
-// KV free tier allows 1,000 writes/day, so each request must cost at most ONE write.
-// installId is client-generated and trivially rotated, so the per-IP counter is the real limit and the
-// only one we persist. The IP is hashed, never stored raw.
+// The IP is hashed so raw addresses are never stored; installId is client-generated and unenforceable,
+// so the per-IP cap is the real limit.
 async function ipKey(req) {
   const ip = req.headers.get("CF-Connecting-IP") || "unknown";
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`xrf:${today()}:${ip}`));
   return Array.from(new Uint8Array(digest).slice(0, 12), b => b.toString(16).padStart(2, "0")).join("");
 }
 
-async function readIpUsed(env, ip) {
-  return Number((await env.QUOTA.get(`ip:${today()}:${ip}`)) || 0);
-}
-
-// The global budget is a coarse backstop behind the per-IP cap, so it is sampled instead of written
-// every request: one write in BUDGET_SAMPLE requests, incremented by SAMPLE x cost (unbiased on average).
-async function bumpBudget(env, cost) {
-  const sample = Number(env.BUDGET_SAMPLE || 25);
-  if (!cost || Math.random() >= 1 / sample) return;
-  const spent = Number((await env.QUOTA.get(`budget:${today()}`)) || 0);
-  await env.QUOTA.put(`budget:${today()}`, String(spent + cost * sample), { expirationTtl: DAY_TTL_S });
-}
+const counters = env => env.COUNTERS.get(env.COUNTERS.idFromName("global"));
 
 async function classify(body, env, req, ctx) {
   const perIp = Number(env.DAILY_PER_IP), budget = Number(env.DAILY_BUDGET_USD);
-  const ip = await ipKey(req);
-  const [ipUsed, spent] = [await readIpUsed(env, ip), Number((await env.QUOTA.get(`budget:${today()}`)) || 0)];
-  if (ipUsed + body.replies.length > perIp) return json({ error: "quota", used: ipUsed, limit: perIp }, 429);
-  if (spent >= budget) return json({ error: "budget" }, 429);
+  const day = today(), ip = await ipKey(req), stub = counters(env);
 
-  const resp = await callJev(env.OPENROUTER_API_KEY, body.original, body.replies, body.categories, body.examples);
-  const nowUsed = ipUsed + body.replies.length;
-  await env.QUOTA.put(`ip:${today()}:${ip}`, String(nowUsed), { expirationTtl: DAY_TTL_S });
-  ctx.waitUntil(bumpBudget(env, resp.usage?.cost || 0));
-  return json({ answers: resp.answers, usage: resp.usage, model: resp.model, quota: { used: nowUsed, limit: perIp } });
+  const slot = await stub.reserve(day, ip, body.replies.length, perIp, budget);
+  if (!slot.ok) return json({ error: slot.reason, used: slot.used, limit: slot.limit }, 429);
+
+  let resp;
+  try {
+    resp = await callJev(env.OPENROUTER_API_KEY, body.original, body.replies, body.categories, body.examples);
+  } catch (e) {
+    ctx.waitUntil(stub.settle(day, ip, body.replies.length, 0, false));
+    throw e;
+  }
+  ctx.waitUntil(stub.settle(day, ip, body.replies.length, resp.usage?.cost || 0, true));
+  return json({ answers: resp.answers, usage: resp.usage, model: resp.model, quota: { used: slot.used, limit: perIp } });
 }
 
 const PAGE_CSS = "body{font:16px/1.65 -apple-system,system-ui,sans-serif;max-width:720px;margin:48px auto;padding:0 20px;color:#0f1419}h1{font-size:28px}h2{font-size:19px;margin-top:32px}code{background:#f2f4f5;padding:1px 5px;border-radius:4px}a{color:#1d9bf0}li{margin:6px 0}.muted{color:#536471;font-size:14px}";
@@ -83,8 +75,13 @@ export default {
     if (req.method === "GET" && url.pathname === "/privacy") return html(PRIVACY);
     if (req.method === "GET" && url.pathname === "/") return html(HOME);
     if (req.method === "GET" && url.pathname === "/quota") {
-      const used = await readIpUsed(env, await ipKey(req));  // reported per IP; the id param is kept for older clients
+      const { used } = await counters(env).usage(today(), await ipKey(req));  // per IP; the id param is kept for older clients
       return json({ used, limit: Number(env.DAILY_PER_IP) });
+    }
+    if (req.method === "GET" && url.pathname === "/report") {
+      if (url.searchParams.get("token") !== env.REPORT_TOKEN) return json({ error: "forbidden" }, 403);
+      const stub = counters(env);
+      return json({ today: await stub.report(today()), history: await stub.history(14) });
     }
     if (req.method !== "POST" || url.pathname !== "/classify") return json({ error: "not_found" }, 404);
     let body; try { body = await req.json(); } catch { return json({ error: "bad_json" }, 400); }

@@ -7,8 +7,8 @@
   const CACHE_COUNT = "cacheCount";
   const MAX_RECENT = 50;
   const EXAMPLE_TEXT = 200;
-  const BATCH_DELAY_MS = 600;
-  const BATCH_SIZE = 8;
+  const BATCH_DELAY_MS = 1500;  // wait longer so batches are fuller: fewer requests, less proxy load
+  const BATCH_SIZE = 20;
   const MAX_TEXT = 600;
   const VERSION = chrome.runtime?.getManifest?.().version || "dev";
   document.documentElement.dataset.xrfVersion = VERSION;  // visible from page context: proves the script is injected
@@ -253,7 +253,9 @@
     if (rule) { console.debug("[xrf] rule hit", rule, data.handle); return collapse(article, rule, null, data); }
     pending.push({ el: article, data });
     stats.pending = pending.length;
-    clearTimeout(timer); timer = setTimeout(flush, BATCH_DELAY_MS);
+    clearTimeout(timer);
+    if (pending.length >= BATCH_SIZE) flush();           // full batch: go now
+    else timer = setTimeout(flush, BATCH_DELAY_MS);      // otherwise wait for the stream to settle
   });
 
   function scan(root) {
