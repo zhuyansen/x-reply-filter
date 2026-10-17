@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Upload and publish a new version to the Chrome Web Store without touching the dashboard UI.
+"""Upload and publish a new version to the Chrome Web Store (API V2) without touching the dashboard UI.
 
 One-time setup (only the consent step needs a human):
   1. https://console.cloud.google.com/ -> create/pick a project
@@ -10,17 +10,23 @@ One-time setup (only the consent step needs a human):
   5. Add http://127.0.0.1:8791 to the client's "Authorized redirect URIs"
   6. python3 ops/publish_store.py auth --id <CLIENT_ID> --secret <SECRET>
      Opens the consent page and catches the redirect locally. The refresh token lands in
-     ~/.config/xrf/store_credentials.json (chmod 600) and is reused forever.
+     ~/.config/xrf/store_credentials.json (chmod 600). While the consent screen is in Testing
+     mode Google expires it 7 days after consent: a refresh that fails with invalid_grant
+     means run auth again.
+  7. Copy the publisher ID from the Developer Dashboard (Publisher > Settings) into
+     ~/.config/xrf/store_publisher_id; V2 names the item publishers/<publisher id>/items/<item id>.
 
 Then every release is:
   python3 ops/publish_store.py upload            # uploads dist/<current version>.zip as a draft
   python3 ops/publish_store.py publish           # submits it for review
-  python3 ops/publish_store.py status
+  python3 ops/publish_store.py status            # fetchStatus: published and submitted revisions
 """
 import argparse, http.server, json, pathlib, subprocess, sys, threading, urllib.parse, webbrowser
 
 ITEM_ID = "ncffadgnbgcfadoaiaglgkbacjepccff"
 CRED = pathlib.Path.home() / ".config/xrf/store_credentials.json"
+PUBLISHER = pathlib.Path.home() / ".config/xrf/store_publisher_id"  # Developer Dashboard -> Publisher -> Settings
+API = "https://chromewebstore.googleapis.com"  # Web Store API V2; V1 (v1.1) was only supported until 2026-10-15
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 LOOPBACK_PORT = 8791  # Google retired the out-of-band flow; desktop apps must use a loopback redirect
 REDIRECT = f"http://127.0.0.1:{LOOPBACK_PORT}"
@@ -106,27 +112,36 @@ def current_zip():
     return version, z
 
 
+def item_name():
+    if not PUBLISHER.exists():
+        sys.exit(f"缺少 publisher ID：从开发者后台 Publisher > Settings 复制到 {PUBLISHER}")
+    return f"publishers/{PUBLISHER.read_text().strip()}/items/{ITEM_ID}"
+
+
 def cmd_upload(_):
     version, zip_path = current_zip()
-    out = json.loads(curl(["-X", "PUT", "-H", f"Authorization: Bearer {access_token()}",
-                           "-H", "x-goog-api-version: 2", "-T", str(zip_path),
-                           f"https://www.googleapis.com/upload/chromewebstore/v1.1/items/{ITEM_ID}"]))
+    url = f"{API}/upload/v2/{item_name()}:upload"
+    out = json.loads(curl(["-X", "POST", "-H", f"Authorization: Bearer {access_token()}", "-T", str(zip_path), url]))
     print(json.dumps(out, indent=1, ensure_ascii=False))
-    if out.get("uploadState") != "SUCCESS":
+    if out.get("uploadState") == "IN_PROGRESS":
+        sys.exit("商店还在处理这个包：跑 status，等 lastAsyncUploadState 变成 SUCCEEDED 再 publish")
+    if out.get("uploadState") != "SUCCEEDED":
         sys.exit(1)
     print(f"已上传 {version}，接着跑: python3 ops/publish_store.py publish")
 
 
 def cmd_publish(_):
+    url = f"{API}/v2/{item_name()}:publish"  # empty body: default publish type, goes through review
     out = json.loads(curl(["-X", "POST", "-H", f"Authorization: Bearer {access_token()}",
-                           "-H", "x-goog-api-version: 2", "-H", "Content-Length: 0",
-                           f"https://www.googleapis.com/chromewebstore/v1.1/items/{ITEM_ID}/publish"]))
+                           "-H", "Content-Length: 0", url]))
     print(json.dumps(out, indent=1, ensure_ascii=False))
+    if "error" in out:
+        sys.exit(1)
 
 
 def cmd_status(_):
-    out = curl(["-H", f"Authorization: Bearer {access_token()}", "-H", "x-goog-api-version: 2",
-                f"https://www.googleapis.com/chromewebstore/v1.1/items/{ITEM_ID}?projection=DRAFT"])
+    url = f"{API}/v2/{item_name()}:fetchStatus"
+    out = curl(["-H", f"Authorization: Bearer {access_token()}", url])
     print(out)
 
 
