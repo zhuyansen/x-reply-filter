@@ -76,6 +76,20 @@ def store_users():
     return None
 
 
+def probe():
+    """A real classify call, because counters alone cannot tell "nobody used it" from "every call failed"."""
+    payload = json.dumps({"installId": "0" * 32,
+                          "original": {"handle": "probe", "text": "Rate limit update."},
+                          "replies": [{"handle": "a", "text": "Does this also apply to the CLI?"}]})
+    try:
+        out = json.loads(fetch(f"{PROXY}/classify", {"Content-Type": "application/json"}, payload))
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:200]}
+    if out.get("answers"):
+        return {"ok": True}
+    return {"ok": False, "error": json.dumps(out, ensure_ascii=False)[:300]}
+
+
 def build():
     rep = proxy_report()
     cf = cf_analytics()
@@ -87,12 +101,30 @@ def build():
     per_req = round(today["replies"] / wk[today["day"]], 1) if wk.get(today["day"]) else None
     if per_req is not None and per_req < 1:
         per_req = None
-    return {"today": today, "history": hist, "cf": cf, "store_users": store_users(), "replies_per_request": per_req}
+    return {"today": today, "history": hist, "cf": cf, "store_users": store_users(),
+            "replies_per_request": per_req, "probe": probe()}
+
+
+def alarms(d):
+    """Conditions that mean the service is broken, not merely quiet."""
+    out, t, hist = [], d["today"], d["history"]
+    if not d["probe"]["ok"]:
+        out.append(f"🔴 判定接口不可用: {d['probe']['error']}")
+    dead = [h for h in hist[:3] if h["ips"] > 0 and h["replies"] == 0]
+    if dead:
+        out.append(f"🔴 最近 {len(dead)} 天有 {dead[0]['ips']} 个 IP 请求但 0 条判定成功 —— 用户只拿到规则过滤")
+    if t["ips"] > 0 and t["spend"] == 0 and t["replies"] > 0:
+        out.append("🟡 有判定但花费为 0，抽样计费可能失效")
+    return out
 
 
 def render(d):
     t, cf = d["today"], d["cf"]
     lines = [f"Reply Filter for X · {t['day']}", ""]
+    for a in alarms(d):
+        lines.append(a)
+    if alarms(d):
+        lines.append("")
     lines.append(f"今日 {t['ips']} 个独立 IP · 判定 {t['replies']} 条回复 · 花费 ${t['spend']:.4f}")
     if d["store_users"]:
         lines.append(f"商店显示用户数: {d['store_users']}")
